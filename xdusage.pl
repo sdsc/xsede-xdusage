@@ -249,12 +249,17 @@ sub get_user
 sub get_users_by_last_name
 {
     my($name) = shift;
-    my($sql) = sprintf ("select distinct person_id, last_name, first_name, is_su
-                         from userv where last_name like %s",
-                          $dbh->quote($name),
-                        );
 
-    db_select_rows ($sql);
+    # construct a rest url and fetch it
+    # don't forget to uri escape these things in case one has funny
+    # characters
+    my $url = sprintf("%s/xdusage/v1/people/by_lastname/%s", 
+      $rest_url, 
+      uri_escape($name));
+    my $result = json_get($url);
+
+    # conveniently, the result is already in the form the caller expects.
+    return $result->{result};
 }
 
 sub get_users
