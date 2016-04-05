@@ -4,12 +4,107 @@ use DBI;
 use Getopt::Long;
 use Date::Manip;
 
+use LWP::UserAgent;
+use JSON;
+use URI::Escape;
+use Data::Dumper;
+
 Getopt::Long::Configure ("no_ignore_case");
 
-my $PASSWORD="xdusage";  # change to correct password as obtained from XDCDB admins
+# find out where this script is running from
+# eliminate the need to configure an install dir
+use FindBin qw($RealBin);
+my($install_dir) = $RealBin;
+
+# load the various settings from a configuration file
+# (db_password, resource_name, admin_name)
+# file is simple key=value, ignore lines that start with #
+
+my($APIKEY);
+my($APIID);
+my($resource);
+my(@admin_names);
+my($conf_file);
+my($rest_url);
+
+my($dbh);
+# list of possible config file locations
+my(@conf_file_list) = ('/etc/xdusage.conf', 
+	      '/var/secrets/xdusage.conf', 
+	      "$install_dir/xdusage.conf",
+	      ) ;
+
+# use the first one found.
+foreach my $c (@conf_file_list)
+{
+    if (-r $c)
+    {
+        $conf_file = $c;
+        last;
+    }
+}
+
+die "Unable to find xdusage.conf in:\n  " . join("\n  ", @conf_file_list) . 
+    "\n" unless ($conf_file);
+
+# read in config file
+open FD, "<$conf_file" or die "$!: $conf_file";
+while(<FD>)
+{
+    chomp;
+    next if ( /^\s*#/ );
+    next if ( /^\s*$/ );
+    if( ! /^([^=]+)=([^=]+)$/ )
+    {
+        print stderr "Ignoring cruft in $conf_file: '$_'\n";
+	next;
+    }
+    my $key = $1;
+    my $val = $2;
+    $key =~ s/^\s*//g;
+    $key =~ s/\s*$//g;
+    $val =~ s/^\s*//g;
+    $val =~ s/\s*$//g;
+
+    if ($key eq 'api_key')
+    {
+        die "Multiple 'api_key' values in $conf_file" if ($APIKEY);
+	$APIKEY = $val;
+    }
+    elsif ($key eq 'api_id')
+    {
+        die "Multiple 'api_id' values in $conf_file" if ($APIID);
+	$APIID = $val;
+    }
+    elsif ($key eq 'resource_name')
+    {
+        die "Multiple 'resource_name' values in $conf_file" if ($resource);
+	$resource = $val;
+    }
+    elsif ($key eq 'admin_name')
+    {
+        unshift(@admin_names,$val);
+    }
+    elsif ($key eq 'rest_url_base')
+    {
+	die "Multiple 'rest_url_base' values in $conf_file" if ($rest_url);
+	$rest_url = $val;
+    }
+    else
+    {
+        print stderr "Ignoring cruft in $conf_file: '$_'\n";
+    }
+}
+close FD or die "$!: $conf_file";
+
+# stop here if missing required values
+die "Unable to find 'api_key' value in $conf_file" unless ($APIKEY);
+die "Unable to find 'resource_name' value in $conf_file" unless ($resource);
+die "Unable to fine 'rest_url_base' value in $conf_file" unless ($rest_url);
+
+
 my($me) = (split /\//, $0)[-1];
 my($logname)     = $ENV{SUDO_USER}           || die "SUDO_USER not set\n";
-my($install_dir) = $ENV{XDUSAGE_INSTALL_DIR} || die "XDUSAGE_INSTALL_DIR not set\n";
 
 my(%options) = ();
 usage() unless 
@@ -40,15 +135,17 @@ version() if option_flag('V');
 
 my($DEBUG) = option_flag('debug');
 my($today) = UnixDate(ParseDate('today'),  "%Y-%m-%d");
-
-my($resource) = get_resource();
 my($is_admin) = is_admin($logname);
 my($xuser) = ($is_admin && $ENV{USER}) ? $ENV{USER} : $logname;
 
-my($dbh)      = db_connect();
-my($user)     = get_user($xuser);
 
+my($user)     = get_user($xuser);
 my(@resources) = get_resources();
+
+print Dumper($user);
+print Dumper(@resources);
+exit();
+
 my(@users)     = get_users();
 my(@plist)     = option_list('p');
 my($sdate, $edate, $edate2) = get_dates();
@@ -65,59 +162,63 @@ error ("No projects and/or accounts found") unless ($any);
 
 exit(0);
 
+
+# perform a request to a URL that returns JSON
+# returns JSON if successful
+# dies if there's an error, printing diagnostic information to
+# stderr.
+# error is:  non-200 result code, or result is not JSON.
+sub json_get($)
+{
+    my($url) = shift;
+
+    # using LWP since it's available by default in most cases
+    my $ua = LWP::UserAgent->new();
+    $ua->default_header('XA-AGENT' => 'xdusage');
+    $ua->default_header('XA-RESOURCE' => $APIID);
+    $ua->default_header('XA-API-KEY' => $APIKEY);
+    my $resp = $ua->get($url);
+
+    # check for bad response code here
+    if (!defined $resp || $resp->code != 200)
+    {
+	die(sprintf("Failure: %s returned erroneous status: %s", $url, $resp->status_line));
+    }
+
+    # do stuff with the body
+    my $json = decode_json($resp->content);
+
+    # not json? this is fatal too.
+    if (!defined $json)
+    {
+	die(sprintf("Failure: %s returned non-JSON output: %s\n", $url, $resp->content));
+    }
+
+    # every response must contain a 'result' field.
+    if (!defined $json->{'result'})
+    {
+	die(sprintf("Failure: %s returned invalid JSON (missing result): %s\n", $url, $resp->content));
+    }
+
+    return $json;
+}
+
 sub db_connect
 {
-    my($host) = 'tgcdb.xsede.org';
-    my($port) = 5432;
-    my($dbh);
-
-    if ($DEBUG)
-    {
-        $host = 'balthazar.sdsc.edu';
-        $port = 3333;
-    }
-    $dbh = DBI->connect ("dbi:Pg:dbname=teragrid;host=$host;port=$port;sslmode=require", 'xdusage', $PASSWORD, 
-                                 {RaiseError => 1, PrintError => 0}
-                         );
-    $dbh->do('set search_path to xdusage');
-    $dbh;
 }
 sub db_disconnect
 {
-    $dbh->disconnect();
-}
-
-sub get_resource()
-{
-    my($file) =  "$install_dir/resource_name";
-    my($name);
-
-    die "${me}: $file - $!\n" unless open FD, $file;
-    while (<FD>)
-    {
-        chomp;
-        $name = $_;
-    }
-    close FD;
-    $name;
 }
 
 sub is_admin()
 {
     my($user) = shift;
-    my($file) =  "$install_dir/xdusage.admins";
-    my($name);
     my($is_admin) = 0;
 
-    return 0 unless (-r $file);
-    die "${me}: $file - $!\n" unless open FD, $file;
-    while (<FD>)
+    foreach (@admin_names)
     {
-        chomp;
-        $name = $_;
-	$is_admin = 1 if ($user eq $name);
+	$is_admin = 1 if ($user eq $_);
     }
-    close FD;
     $is_admin;
 }
 
@@ -125,13 +226,24 @@ sub get_user
 {
     my($username, $portal) = @_;
     my($rs) = $portal ? 'portal.teragrid' : $resource;
-    my($sql) = sprintf ("select distinct person_id, last_name, first_name, is_su
-                         from userv where username like %s and resource_name=%s",
-                          $dbh->quote($username),
-                          $dbh->quote($rs),
-                        );
 
-    db_select_rows ($sql);
+    # construct a rest url and fetch it
+    # don't forget to uri escape these things in case one has funny
+    # characters
+    my $url = sprintf("%s/xdusage/v1/people/by_username/%s/%s", 
+      $rest_url, 
+      uri_escape($rs), 
+      uri_escape($username));
+    my $result = json_get($url);
+
+    # there should be only one row returned here...
+    if (scalar @{$result->{result}} > 1)
+    {
+	die(sprintf("Multiple user records for user %s on resource %s\n", 
+	  $username, $rs));
+    }
+
+    return $result->{result}[0];
 }
 
 sub get_users_by_last_name
@@ -171,18 +283,26 @@ sub get_users
 sub get_resources
 {
     my(@resources) = ();
-    my($name, $r, $sql);
+    my($name, $r);
     my($pat);
     my($any);
+    my($url);
 
     foreach $name (option_list('r'))
     {
+	# since nobody remembers the full name, do a search based on
+	# the subcomponents provided
 	$pat = $name;
-	$pat = "$pat.%" unless ($name =~ /[.%]/);
-    	$sql = sprintf "select resource_id from rsv where resource_name like %s or resource_name = %s",
-		$dbh->quote($pat), $dbh->quote($name);
+	$pat = "$name.%" unless ($name =~ /[.%]/);
+
+	# create a rest url and fetch
+	$url = sprintf("%s/xdusage/v1/resources/%s",
+	  $rest_url,
+	  uri_escape($pat));
+	my $result = json_get($url);
+
 	$any = 0;
-	foreach $r (db_select_rows($sql))
+	foreach $r (@{$result->{result}})
 	{
 	    push @resources, $r->{resource_id};
 	    $any = 1;
