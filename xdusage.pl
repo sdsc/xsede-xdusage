@@ -1,6 +1,5 @@
 #!/usr/bin/env perl
 use strict;
-use DBI;
 use Getopt::Long;
 use Date::Manip;
 
@@ -17,7 +16,7 @@ use FindBin qw($RealBin);
 my($install_dir) = $RealBin;
 
 # load the various settings from a configuration file
-# (db_password, resource_name, admin_name)
+# (api_id, api_key, rest_url_base, resource_name, admin_name)
 # file is simple key=value, ignore lines that start with #
 
 my($APIKEY);
@@ -27,7 +26,6 @@ my(@admin_names);
 my($conf_file);
 my($rest_url);
 
-my($dbh);
 # list of possible config file locations
 my(@conf_file_list) = ('/etc/xdusage.conf', 
 	      '/var/secrets/xdusage.conf', 
@@ -145,12 +143,7 @@ my(@resources) = get_resources();
 my(@users)     = get_users();
 my(@plist)     = option_list('p');
 my($sdate, $edate, $edate2) = get_dates();
-
 my(@projects) = get_projects();
-
-print Dumper(@projects);
-exit(0);
-
 my($project);
 my($any) = 0;
 foreach $project (@projects)
@@ -202,13 +195,6 @@ sub json_get($)
     return $json;
 }
 
-sub db_connect
-{
-}
-sub db_disconnect
-{
-}
-
 sub is_admin()
 {
     my($user) = shift;
@@ -221,7 +207,7 @@ sub is_admin()
     $is_admin;
 }
 
-# returns a hashref of user info for a given username at a given resource
+# returns a list of hashref of user info for a given username at a given resource
 # resource defaults to config param resource_name; if second arg evaluates 
 # to true, use the portal as the resource.
 sub get_user
@@ -245,7 +231,7 @@ sub get_user
 	  $username, $rs));
     }
 
-    return $result->{result}[0];
+    return @{$result->{result}};
 }
 
 # returns a list of hashrefs of user info for all users with the
@@ -263,7 +249,7 @@ sub get_users_by_last_name
     my $result = json_get($url);
 
     # conveniently, the result is already in the form the caller expects.
-    return $result->{result};
+    return @{$result->{result}};
 }
 
 # returns a list of hashrefs of user info for every user
@@ -385,7 +371,7 @@ sub get_projects
 	return ();
     }
 
-    return  $result->{result};
+    return  @{$result->{result}};
 }
 
 # return curent allocation info for account_id on resource_id
@@ -410,49 +396,52 @@ sub get_allocation
     my $result = json_get($url);
 
     # the caller checks for undef, so we're good to go.
-    if (scalar @{$result->{result}} < 1)
-    {
-	return undef;
-    }
-
-    return $result->{result}[0];
+    # note that the result is NOT an array this time.
+    return $result->{result};
 }
 
+# return list of hashref of account info on a given project
+# optionally filtered by username list and active-only
 sub get_accounts
 {
     my($project) = shift;
     my($person_id) = $user->{person_id};
     my($is_su)     = $user->{is_su};
 
-    my($sql) = "select * from acctv
-                 where account_id = $project->{account_id}
-                   and resource_id = $project->{resource_id}\n
-               ";
+    my(@urlparams);
+
+    # filter by personid(s)
     if (@users || !(option_flag('a') || $is_su))
     {
-        my($users) = @users ? join (',', map {$_->{person_id}} @users) : $person_id;
-	$sql .= " and person_id in ($users)\n";
+	if (scalar @users)
+	{
+	    unshift(@urlparams, sprintf("person_id=%s",
+	      uri_escape(join(',', map {$_->{person_id}} @users))));
+	}
+	else
+	{
+	    unshift(@urlparams, sprintf("person_id=%s",
+	      uri_escape($person_id)));
+	}
     }
-    $sql .= " and acct_state = 'active'\n" if (option_flag('ia'));
-    $sql .= "\norder by is_pi desc, last_name, first_name\n";
-    db_select_rows ($sql);
-}
-
-sub db_select_rows
-{
-    my($sql) = shift;
-    my(@rows) = ();
-    my($sth, $row);
-
-    $sth = $dbh->prepare ($sql);
-    $sth->execute;
-    while ($row = $sth->fetchrow_hashref)
+	 
+    # filter by active accounts
+    if (option_flag('ia'))
     {
-        push @rows, $row
+	unshift(@urlparams, "active_only");
     }
-    $sth->finish;
 
-    @rows;
+    # construct a rest url and fetch it
+    # input has already been escaped
+    my $url = sprintf("%s/xdusage/v1/accounts/%s/%s?%s", 
+      $rest_url,
+      $project->{account_id},
+      $project->{resource_id},
+      join('&', @urlparams));
+    my $result = json_get($url);
+
+    # caller checks for undef
+    return @{$result->{result}};
 }
 
 sub option_list
@@ -709,102 +698,189 @@ sub get_dates
     ($sdate, $edate, $edate2);
 }
 
+# returns number (float) of SUs used by a given person_id on allocation_id
 sub get_usage_on_allocation
 {
     my($allocation_id, $person_id) = @_;
 
-    my($sql) = "select su_used from abv where allocation_id = $allocation_id and person_id = $person_id";
-    my($x) = db_select_rows($sql);
+    # construct a rest url and fetch it
+    # don't forget to uri escape these things in case one has funny
+    # characters
+    my $url = sprintf("%s/xdusage/v1/usage/by_allocation/%s/%s", 
+      $rest_url, 
+      uri_escape($allocation_id), 
+      uri_escape($person_id));
+    my $result = json_get($url);
 
-    return $x ? $x->{su_used} : 0;
+    if ( defined $result->{result}[0]->{su_used} )
+    {
+	return $result->{result}[0]->{su_used};
+    }
+
+    return 0.0;
 }
 
+# return list of hashref of job info for a given allocation_id and person_id
 sub get_jv_on_allocation
 {
     my($allocation_id, $person_id) = @_;
 
-    my($sql) = "select * from jv where allocation_id = $allocation_id and person_id = $person_id";
-    $sql .= " order by submit_time, local_jobid";
-    db_select_rows($sql);
+    # construct a rest url and fetch it
+    # don't forget to uri escape these things in case one has funny
+    # characters
+    my $url = sprintf("%s/xdusage/v1/jobs/by_allocation/%s/%s", 
+      $rest_url, 
+      uri_escape($allocation_id), 
+      uri_escape($person_id));
+    my $result = json_get($url);
+
+    # caller expects a list
+    if (scalar @{$result->{result}} < 1)
+    {
+	return ();
+    }
+
+    return @{$result->{result}};
 }
 
+# return list of hashref of credits/debits on allocation_id by person_id
 sub get_cdv_on_allocation
 {
     my($allocation_id, $person_id) = @_;
 
-    my($sql) = "select * from cdv where allocation_id = $allocation_id and person_id = $person_id";
-    $sql .= " order by type, charge_date";
-    db_select_rows($sql);
+    # construct a rest url and fetch it
+    # don't forget to uri escape these things in case one has funny
+    # characters
+    my $url = sprintf("%s/xdusage/v1/credits_debits/by_allocation/%s/%s", 
+      $rest_url, 
+      uri_escape($allocation_id), 
+      uri_escape($person_id));
+    my $result = json_get($url);
+
+    # caller expects a list
+    if (scalar @{$result->{result}} < 1)
+    {
+	return ();
+    }
+
+    return @{$result->{result}};
 }
 
+# return list of hashref of job info for a given account_id, resource_id,
+# and person_id bounded by dates
 sub get_jv_by_dates
 {
     my($account_id, $resource_id, $person_id) = @_;
 
-    my($sql) = "select * from jv where account_id = $account_id and resource_id = $resource_id";
-    $sql .= " and person_id = $person_id";
-    $sql .= date_clause();
-    $sql .= " order by submit_time, local_jobid";
+    # construct a rest url and fetch it
+    # don't forget to uri escape these things in case one has funny
+    # characters
+    my $url = sprintf("%s/xdusage/v1/jobs/by_dates/%s/%s/%s/%s/%s", 
+      $rest_url, 
+      uri_escape($account_id), 
+      uri_escape($resource_id),
+      uri_escape($person_id),
+      uri_escape($sdate),
+      uri_escape(get_enddate()));
+    my $result = json_get($url);
 
-    db_select_rows($sql);
+    # caller expects a list
+    if (scalar @{$result->{result}} < 1)
+    {
+	return ();
+    }
+
+    return @{$result->{result}};
 }
 
+# return a list of hashref of credit/debit info given account_id, resource_id,
+# person_id bounded by dates
 sub get_cdv_by_dates
 {
     my($account_id, $resource_id, $person_id) = @_;
 
-    my($sql) = "select * from cdv where account_id = $account_id and resource_id = $resource_id";
-    $sql .= " and person_id = $person_id";
-    $sql .= date_clause();
-    $sql .= " order by type, charge_date";
+    # construct a rest url and fetch it
+    # don't forget to uri escape these things in case one has funny
+    # characters
+    my $url = sprintf("%s/xdusage/v1/credits_debits/by_dates/%s/%s/%s/%s/%s", 
+      $rest_url, 
+      uri_escape($account_id), 
+      uri_escape($resource_id),
+      uri_escape($person_id),
+      uri_escape($sdate),
+      uri_escape(get_enddate()));
+    my $result = json_get($url);
 
-    db_select_rows($sql);
+    # caller expects a list
+    if (scalar @{$result->{result}} < 1)
+    {
+	return ();
+    }
+
+    return @{$result->{result}};
 }
 
+# return a hashref of usage info given account_id, resource_id,
+# and bounded by date
+# optionally filtered by person_id
 sub get_usage_by_dates
 {
     my($account_id, $resource_id, $person_id) = @_;
 
-    my($sql) = "select min(charge_date)::date as start_date,
-                       max(charge_date)::date as end_date,
-		       sum(charge) as su_used
-		  from usagev
-		 where account_id = $account_id
-		   and resource_id = $resource_id";
-    $sql .= " and person_id = $person_id" if (defined $person_id);
-    $sql .= date_clause();
+    # construct a rest url and fetch it
+    # don't forget to uri escape these things in case one has funny
+    # characters
+    my $url = sprintf("%s/xdusage/v1/usage/by_dates/%s/%s/%s/%s", 
+      $rest_url, 
+      uri_escape($account_id), 
+      uri_escape($resource_id),
+      uri_escape($sdate),
+      uri_escape(get_enddate()));
+    if ($person_id)
+    {
+	$url .= sprintf("?person_id=%s", uri_escape($person_id));
+    }
+    my $result = json_get($url);
 
-    my($x) = db_select_rows($sql);
-    $x;
+    # caller expects just a hashref
+    if ( scalar @{$result->{result}} < 1 )
+    {
+	return {};
+    }
+
+    return $result->{result}[0];
 }
 
+# return a string of credit/debit counts by type for a given account_id
+# and resource_id, bounded by dates
+# optionally filtered by person_id
+# format is space-delmited, type=count[ ...]
 sub get_counts_by_dates
 {
     my($account_id, $resource_id, $person_id) = @_;
-    my($where) = "account_id=$account_id and resource_id=$resource_id";
-    $where .= " and person_id=$person_id" if (defined $person_id);
-    $where .= date_clause();
-    get_counts($where, $person_id);
-}
 
-sub get_counts_on_allocation
-{
-    my($allocation_id, $person_id) = @_;
-    my($where) = "allocation_id=$allocation_id";
-    $where .= " and person_id=$person_id" if (defined $person_id);
-    get_counts($where, $person_id);
-}
+    # construct a rest url and fetch it
+    # don't forget to uri escape these things in case one has funny
+    # characters
+    my $url = sprintf("%s/xdusage/v1/counts/by_dates/%s/%s/%s/%s", 
+      $rest_url, 
+      uri_escape($account_id), 
+      uri_escape($resource_id),
+      uri_escape($sdate),
+      uri_escape(get_enddate()));
+    if ($person_id)
+    {
+	$url .= sprintf("?person_id=%s", uri_escape($person_id));
+    }
+    my $result = json_get($url);
 
-sub get_counts
-{
-    my($where, $lowercase) = @_;
-    my(@counts) = ();
-    my($j) = 0;
-    my(@x, $x);
-    my($type, $n);
-
-    @x = db_select_rows ("select type, count(*) as n from usagev where $where group by type order by type");
-    foreach $x (@x)
+    # munge into a string according to some weird rules
+    # original code will lowercase a type name if person_id is set and
+    # evaluates to true... huh?  just emulating the same behavior.
+    my $j = 0;
+    my(@counts,$type,$n);
+    my $lowercase = $person_id ? 1 : 0;
+    foreach my $x (@{$result->{result}})
     {
     	($type, $n) = ($x->{type}, $x->{n});
 	if ($type eq 'job')
@@ -825,12 +901,67 @@ sub get_counts
     "@counts";
 }
 
-sub date_clause
+# return a string of credit/debit counts by type for a given allocation_id
+# optionally filtered by person_id
+# format is space-delmited, type=count[ ...]
+sub get_counts_on_allocation
 {
-    my($sql) = '';
-    $sql .= " and charge_date >= '$sdate'"  if ($sdate);
-    $sql .= " and charge_date <  '$edate2'" if ($edate2);
-    $sql;
+    my($allocation_id, $person_id) = @_;
+
+    # construct a rest url and fetch it
+    # don't forget to uri escape these things in case one has funny
+    # characters
+    my $url = sprintf("%s/xdusage/v1/counts/by_allocation/%s", 
+      $rest_url, 
+      uri_escape($allocation_id));
+    if ($person_id)
+    {
+	$url .= sprintf("?person_id=%s", uri_escape($person_id));
+    }
+    my $result = json_get($url);
+
+    # munge into a string according to some weird rules
+    # original code will lowercase a type name if person_id is set and
+    # evaluates to true... huh?  just emulating the same behavior.
+    my $j = 0;
+    my(@counts,$type,$n);
+    my $lowercase = $person_id ? 1 : 0;
+    foreach my $x (@{$result->{result}})
+    {
+    	($type, $n) = ($x->{type}, $x->{n});
+	if ($type eq 'job')
+	{
+	    $j = $n
+	}
+	else
+	{
+	    $type .= 's' unless ($type eq 'storage');
+	    $type = ucfirst($type) unless ($lowercase);
+	    push @counts, "$type=$n";
+	}
+    }
+    $type = $lowercase ? 'jobs' : 'Jobs';
+
+    unshift @counts, "$type=$j";
+
+    "@counts";
+}
+
+# return a suitable end date in UnixDate form
+# uses edate2 if provided, otherwise today + 1 day
+#
+# needed since REST API requires an end date and
+# end date is an optional argument.
+sub get_enddate
+{
+    if (!$edate2)
+    {
+	return UnixDate(DateCalc(ParseDate('today'), "+ 1 day"), "%Y-%m-%d");
+    }
+    else
+    {
+	return $edate2;
+    }
 }
 
 sub fmt_amount
