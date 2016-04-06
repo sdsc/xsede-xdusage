@@ -142,15 +142,14 @@ my($xuser) = ($is_admin && $ENV{USER}) ? $ENV{USER} : $logname;
 my($user)     = get_user($xuser);
 my(@resources) = get_resources();
 
-print Dumper($user);
-print Dumper(@resources);
-exit();
-
 my(@users)     = get_users();
 my(@plist)     = option_list('p');
 my($sdate, $edate, $edate2) = get_dates();
 
 my(@projects) = get_projects();
+
+print Dumper(@projects);
+exit(0);
 
 my($project);
 my($any) = 0;
@@ -222,6 +221,9 @@ sub is_admin()
     $is_admin;
 }
 
+# returns a hashref of user info for a given username at a given resource
+# resource defaults to config param resource_name; if second arg evaluates 
+# to true, use the portal as the resource.
 sub get_user
 {
     my($username, $portal) = @_;
@@ -246,6 +248,8 @@ sub get_user
     return $result->{result}[0];
 }
 
+# returns a list of hashrefs of user info for all users with the
+# given last name.
 sub get_users_by_last_name
 {
     my($name) = shift;
@@ -262,6 +266,8 @@ sub get_users_by_last_name
     return $result->{result};
 }
 
+# returns a list of hashrefs of user info for every user
+# described by the -u and -up arguments.
 sub get_users
 {
     my(@users) = ();
@@ -285,6 +291,7 @@ sub get_users
     @users;
 }
 
+# return a list of resource IDs (numeric) described by -r arguments.
 sub get_resources
 {
     my(@resources) = ();
@@ -318,67 +325,97 @@ sub get_resources
     @resources;
 }
 
+# return a list of hashrefs of project info described by
+# -p (project list), -ip (filter active) args
+# restricted to non-expired projects associated with
+# current user by default
 sub get_projects
 {
     return unless ($user);
 
     my($person_id) = $user->{person_id};
     my($is_su)     = $user->{is_su};
-    my(@tables) = ("projv p");
-    my(@where) = ();
-    my($p, @p);
 
-    unless ($is_su && @plist)
+    my(@urlparams);
+
+    # filter by project list?
+    # (grant number, charge number)
+    if (scalar @plist)
     {
-        push @tables, "abxv a1";
-        push @where, "p.account_id = a1.account_id";
-        push @where, "p.resource_id = a1.resource_id";
-        push @where, "a1.person_id = $person_id";
+	unshift(@urlparams, sprintf("projects=%s",
+	  uri_escape(lc(join(',', @plist)))));
     }
-    if (@plist)
-    {
-	@p = ();
-	foreach $p (@plist)
-	{
-	    push @p, "lower(p.charge_number) like lower(" . $dbh->quote($p) . ")";
-	    push @p, "lower(p.grant_number)  like lower(" . $dbh->quote($p) . ")";
-	}
-        push @where, '(' . join (' or ', @p) . ')';
-    }
+    # If not filtering by project list, show all non-expired
     else
     {
-        push @where, "not p.is_expired";
+	unshift(@urlparams, "not_expired");
     }
-    push @where, "proj_state = 'active'" if (option_flag('ip'));
-    if (@resources)
+
+    # non-su users are filtered by person_id 
+    # so they can't see someone else's project info
+    if (!$is_su)
     {
-        my($resources) = join (',', @resources);
-        push @where, "p.resource_id in ($resources)";
+	unshift(@urlparams, sprintf("person_id=%s", 
+	  uri_escape($person_id)));
     }
 
-    my($where)  = join (' and ', @where);
-    my($tables) = join (',', @tables);
+    # filter by active
+    if (option_flag('ip'))
+    {
+	unshift(@urlparams, "active_only");
+    }
 
-    my($sql) = "select distinct p.* from $tables where $where order by grant_number, resource_name";
+    # filter by resources
+    if (scalar @resources)
+    {
+	unshift(@urlparams, sprintf("resources=%s",
+	    uri_escape(join(',',@resources))));
+    }
 
-    db_select_rows ($sql);
+    # construct a rest url and fetch it
+    # input has already been escaped
+    my $url = sprintf("%s/xdusage/v1/projects?%s", 
+      $rest_url, 
+      join('&', @urlparams));
+    my $result = json_get($url);
+
+    # return an empty array if no results
+    if (scalar @{$result->{result}} < 1)
+    {
+	return ();
+    }
+
+    return  $result->{result};
 }
 
+# return curent allocation info for account_id on resource_id
+# returns previous allocation info if 3rd argument evaluates to true.
 sub get_allocation
 {
     my($account_id, $resource_id, $previous) = @_;
 
-    my($sql) = "select *
-                  from av
-                 where account_id = $account_id
-                   and resource_id = $resource_id
-                 order by alloc_start desc
-		 limit 2
-               ";
+    my($prevstr) = "current";
+    if ($previous)
+    {
+	$prevstr = "previous";
+    }
 
-    my(@a) = db_select_rows($sql);
+    # construct a rest url and fetch it
+    # don't forget to escape input...
+    my $url = sprintf("%s/xdusage/v1/allocations/%s/%s/%s", 
+      $rest_url, 
+      uri_escape($account_id),
+      uri_escape($resource_id),
+      uri_escape($prevstr));
+    my $result = json_get($url);
 
-    $previous ? $a[1] : $a[0];
+    # the caller checks for undef, so we're good to go.
+    if (scalar @{$result->{result}} < 1)
+    {
+	return undef;
+    }
+
+    return $result->{result}[0];
 }
 
 sub get_accounts
