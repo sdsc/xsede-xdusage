@@ -11,9 +11,25 @@ use Data::Dumper;
 Getopt::Long::Configure ("no_ignore_case");
 
 # find out where this script is running from
-# eliminate the need to configure an install dir
+# eliminates the need to configure an install dir
 use FindBin qw($RealBin);
 my($install_dir) = $RealBin;
+
+# this needs to be run by sudo, as we're using 
+# sudo to provide a reasonably-assured user id
+# sudoers should have:
+#  Defaults!/path/to/xdusage.pl runas_default=<xdusage user>
+#  Defaults!/path/to/xdusage.pl env_keep="USER"
+#  ALL  ALL=(<xdusage user>) NOPASSWD:/path/to/xdusage.pl
+if (!defined($ENV{SUDO_USER}))
+{
+    # try again with sudo
+    unshift(@ARGV,"$install_dir/xdusage.pl");
+    unshift(@ARGV,"sudo");
+    exec @ARGV;
+}
+my($logname)     = $ENV{SUDO_USER}           || die "SUDO_USER not set\n";
+
 
 # load the various settings from a configuration file
 # (api_id, api_key, rest_url_base, resource_name, admin_name)
@@ -102,8 +118,6 @@ die "Unable to fine 'rest_url_base' value in $conf_file" unless ($rest_url);
 
 
 my($me) = (split /\//, $0)[-1];
-my($logname)     = $ENV{SUDO_USER}           || die "SUDO_USER not set\n";
-
 my(%options) = ();
 usage() unless 
  GetOptions (\%options,
@@ -134,6 +148,8 @@ version() if option_flag('V');
 my($DEBUG) = option_flag('debug');
 my($today) = UnixDate(ParseDate('today'),  "%Y-%m-%d");
 my($is_admin) = is_admin($logname);
+
+# admins can set USER to something else and view their allocation
 my($xuser) = ($is_admin && $ENV{USER}) ? $ENV{USER} : $logname;
 
 
