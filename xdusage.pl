@@ -6,7 +6,6 @@ use Date::Manip;
 use LWP::UserAgent;
 use JSON;
 use URI::Escape;
-use Data::Dumper;
 
 Getopt::Long::Configure ("no_ignore_case");
 
